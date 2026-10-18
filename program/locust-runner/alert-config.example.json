@@ -1,0 +1,8 @@
+{
+  "faoLevel": "calm",
+  "minLevel": 2,
+  "notifyOnChange": true,
+  "webhookUrl": "",
+  "telegram": { "botToken": "", "chatId": "" },
+  "reportsCsv": ""
+}
