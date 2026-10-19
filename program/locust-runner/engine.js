@@ -143,6 +143,7 @@
         const tr = new Float32Array((steps + 1) * 2).fill(NaN);
         let lat = src.lat + E.gauss(r) * (src.spread != null ? src.spread : 0.25), lon = src.lon + E.gauss(r) * (src.spread != null ? src.spread : 0.25);
         const start = (src.start || 0) + Math.floor(r() * o.startSpread), kf = (0.7 + r() * 0.3) * o.windScale, thr = o.thrMin + r() * o.thrRange;
+        const rot = src.rot != null ? src.rot : (o.randomDir ? r() * 2 * Math.PI : 0), cr = Math.cos(rot), sr = Math.sin(rot);
         let nx = 0, ny = 0, seaH = 0, arrived = null, warned = null, dead = false, restUntil = -1, dist = 0;
         const hit = extra.map(() => null);
         for (let s = 0; s <= steps; s++) {
@@ -165,7 +166,8 @@
           const fly = onLand ? (day && T >= thr && sp < 50 && h >= restUntil) : true;
           if (!fly) continue;
           nx = 0.9 * nx + E.gauss(r) * 2.2; ny = 0.9 * ny + E.gauss(r) * 2.2;
-          let dx = w.u * kf + nx, dy = w.v * kf + ny;
+          const wu = rot ? w.u * cr - w.v * sr : w.u, wv = rot ? w.u * sr + w.v * cr : w.v;
+          let dx = wu * kf + nx, dy = wv * kf + ny;
           if (tgt && o.attract) {
             const d = E.distKm(lat, lon, tgt.lat, tgt.lon);
             if (d < o.attractKm && d > 0.5) {
@@ -223,6 +225,57 @@
     const modelP = sim.models.map(m => E.probBy(sim, sim.steps, m));
     const modelReach = sim.models.map(m => sim.list.some(S => S.p >= 0.02 && S.arr.some((a, i) => a !== null && S.model[i] === m)));
     return { cum, perModel, P2: P(48), P7: P(168), PH: P(sim.steps), eta, etaSrc, etaAny, etaAnySrc, eta10: q(0.1), eta50: q(0.5), eta90: q(0.9), modelP, modelReach };
+  };
+  /* arrival probabilities for any site, computed from the same tracks (no attraction to that site) */
+  E.siteProb = function (sim, lat, lon, rkm) {
+    rkm = rkm || 50;
+    const dl = rkm / 111, per = [];
+    let first = null;
+    for (const S of sim.list) {
+      const arr = [];
+      for (const tr of S.tracks) {
+        let a = null;
+        for (let s = 0; s <= sim.steps; s += 1) {
+          const la = tr[2 * s]; if (isNaN(la)) continue;
+          if (Math.abs(la - lat) > dl) continue;
+          if (E.distKm(la, tr[2 * s + 1], lat, lon) <= rkm) { a = s; break; }
+        }
+        arr.push(a); if (a !== null && a > 0 && S.p >= 0.02 && (first === null || a < first)) first = a;
+      }
+      per.push({ p: S.p, arr, name: S.src.name });
+    }
+    const P = hh => { let q = 1; for (const x of per) { const k = x.arr.filter(a => a !== null && a > 0 && a <= hh).length; q *= 1 - x.p * k / x.arr.length; } return 1 - q; };
+    return { P2: P(48), P7: P(168), PH: P(sim.steps), first, per };
+  };
+  /* where swarms could pass: track positions every 6 h on a 0.5° grid, weighted by the chance the swarm exists */
+  E.riskGrid = function (sim, bb, res) {
+    res = res || 0.5;
+    const W = Math.round((bb.E - bb.W) / res), Hh = Math.round((bb.N - bb.S) / res), g = new Float32Array(W * Hh);
+    for (const S of sim.list) {
+      const w = S.p / S.tracks.length;
+      for (const tr of S.tracks) {
+        const seen = new Set();
+        for (let s = 0; s <= sim.steps; s += 6) {
+          const la = tr[2 * s], lo = tr[2 * s + 1]; if (isNaN(la)) continue;
+          const i = Math.floor((lo - bb.W) / res), j = Math.floor((bb.N - la) / res);
+          if (i < 0 || j < 0 || i >= W || j >= Hh) continue;
+          const k = j * W + i; if (seen.has(k)) continue; seen.add(k); g[k] += w;
+        }
+      }
+    }
+    return { g, W, H: Hh, res, bb };
+  };
+  /* evidence-based proximity hazard (see C.PROX): 7-day probability from distances (km) to recent swarms and bands */
+  E.proxProb = function (P, dSwarm, dBand) {
+    const pick = (arr, d) => { if (d == null || !isFinite(d)) return null; let i = 0; while (i < P.bands.length - 1 && d >= P.bands[i + 1]) i++; return arr[i]; };
+    const ps = pick(P.swarm5, dSwarm), pb = pick(P.band30, dBand);
+    if (ps == null && pb == null) return P.quiet;
+    return 1 - (1 - (ps || 0)) * (1 - (pb || 0));
+  };
+  /* combine track-based and proximity probabilities over 48 h, 7 days and the horizon */
+  E.combine = function (t, p7, horizonH) {
+    const scale = h => 1 - Math.pow(1 - p7, h / 168);
+    return { P2: 1 - (1 - t.P2) * (1 - scale(48)), P7: 1 - (1 - t.P7) * (1 - p7), PH: 1 - (1 - t.PH) * (1 - scale(horizonH)), prox7: p7, track: t };
   };
   E.LEVELS = ["green", "yellow", "orange", "red"];
   E.level = function (s, ctx) {

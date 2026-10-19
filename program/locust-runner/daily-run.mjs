@@ -76,8 +76,23 @@ async function main() {
   const land = E.makeLand(S.geo, C.BBOX), ndvi = E.makeNdvi(E.u8(S.ndvi.now.b64), S.ndviGrid);
   const h0 = Math.max(0, Math.min(grid.hours - 48, Math.floor((Date.now() - grid.t0) / 3600e3)));
   const month = new Date(grid.t0 + h0 * 3600e3).getUTCMonth();
-  const fao = cfg.faoLevel || "calm";
-  const sources = C.SOURCES.map((s, i) => ({ lat: s.lat, lon: s.lon, name: s.ar, p: E.LEVEL_F[fao] * E.SEASON[s.s][month] * E.ecoFactor(ndvi.around(s.lat, s.lon, 60), rain[i].past, rain[i].next) }));
+  /* live FAO Desert Locust observations (CC BY 4.0), last 120 days */
+  let obs = [];
+  try {
+    console.log("Fetching FAO locust observations…");
+    const sql = "SELECT lat, lon, start_date, category, country_name, location_name FROM `fao-maps.fao_locusts.vw_locusts_master` WHERE category IN ('SWARM','ADULT','HOPPER','BAND') AND lat BETWEEN 4 AND 34 AND lon BETWEEN 24 AND 60 AND start_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 120 DAY) ORDER BY start_date DESC";
+    const r = await fetch("https://api.data.apps.fao.org/api/v2/bigquery?query=" + encodeURIComponent(sql), { signal: AbortSignal.timeout(120000) });
+    const rows = E.parseCSV(await r.text()), hd = rows[0] || [], ix = k => hd.indexOf(k), code = { SWARM: "S", BAND: "B", HOPPER: "H", ADULT: "A" };
+    obs = rows.slice(1).map(x => ({ lat: +x[ix("lat")], lon: +x[ix("lon")], d: x[ix("start_date")], c: code[x[ix("category")]], n: x[ix("country_name")], l: x[ix("location_name")] })).filter(o => o.c && isFinite(o.lat)).map(o => Object.assign(o, { t: Date.parse(o.d + "T12:00Z") }));
+  } catch (e) { console.log("FAO observations unavailable:", e.message); obs = ((S.fao && S.fao.obs) || []).map(o => Object.assign({}, o, { t: Date.parse(o.d + "T12:00Z") })); }
+  const tStart = grid.t0 + h0 * 3600e3, recent = (days, cats) => obs.filter(o => cats.includes(o.c) && tStart - o.t <= days * 864e5 && o.t - tStart <= 864e5);
+  /* FAO level: configured value, raised automatically by what FAO reported in the last 30 days */
+  const order = ["calm", "caution", "threat", "danger"], r30 = recent(30, ["S", "B", "H", "A"]).filter(o => o.lat >= 8 && o.lon >= 30), cnt = c => r30.filter(o => o.c === c).length;
+  const sug = cnt("S") >= 10 ? "danger" : (cnt("S") > 0 || cnt("B") >= 5) ? "threat" : (cnt("B") > 0 || cnt("H") >= 5 || cnt("A") >= 30) ? "caution" : "calm";
+  const fao = order[Math.max(order.indexOf(cfg.faoLevel || "calm"), order.indexOf(sug))];
+  const boost = (s) => recent(45, ["B", "H", "A"]).reduce((b, o) => E.distKm(o.lat, o.lon, s.lat, s.lon) > 300 ? b : Math.max(b, o.c === "B" ? 0.35 : o.c === "H" ? 0.2 : 0.06), 0);
+  const sources = C.SOURCES.map((s, i) => ({ lat: s.lat, lon: s.lon, name: s.ar, p: Math.max(boost(s), E.LEVEL_F[fao] * E.SEASON[s.s][month] * E.ecoFactor(ndvi.around(s.lat, s.lon, 60), rain[i].past, rain[i].next)) }));
+  const seenSw = new Set(); for (const o of recent(10, ["S"])) { const k = Math.round(o.lat * 2) + ":" + Math.round(o.lon * 2) + ":" + o.d; if (seenSw.has(k) || seenSw.size >= 25) continue; seenSw.add(k); sources.push({ lat: o.lat, lon: o.lon, p: 1, n: 30, spread: 0.1, name: "سرب رصدته الفاو: " + (o.l || o.n) + " (" + o.d + ")" }); }
   /* confirmed reports from a CSV file (FAO Locust Hub export or Weqaa) */
   if (cfg.reportsCsv && fs.existsSync(path.resolve(dir, cfg.reportsCsv))) {
     const t0 = grid.t0 + h0 * 3600e3;
@@ -86,7 +101,11 @@ async function main() {
     console.log(`Confirmed reports in model: ${rep.length}`);
   }
   const sim = E.simulate({ grid, land, ndvi, target: C.KAIG, h0, sources, models: [0, 1, 2], opts: { nmem: 60 } });
-  const sum = E.summarize(sim);
+  const ts = E.summarize(sim);
+  /* evidence-based closeness to swarms (5 days) and hopper bands (30 days), calibrated on FAO data 2004–2026 */
+  const nearest = list => list.length ? list.reduce((m, o) => Math.min(m, E.distKm(C.KAIG.lat, C.KAIG.lon, o.lat, o.lon)), Infinity) : null;
+  const dS = nearest(recent(5, ["S"])), dB = nearest(recent(30, ["B"])), p7 = E.proxProb(C.PROX, dS, dB);
+  const sum = Object.assign({}, ts, E.combine(ts, p7, sim.steps));
   const sr = E.seasonRisk(C, seas, rain, fao);
   const soon = Math.max(...sr.months.slice(1, 3).map(m => m.risk), 0);
   const level = E.level(sum, { seasonSoon: soon });
@@ -99,15 +118,17 @@ async function main() {
     `درع الجراد – حدائق الملك عبدالله العالمية`,
     `المستوى: ${LEVEL_NAMES[level.i]} (${WHY[level.why]})`,
     `احتمال الوصول: 48 ساعة ${fmt(sum.P2)} · 7 أيام ${fmt(sum.P7)} · 16 يوماً ${fmt(sum.PH)}`,
+    `منها: القرب من أسراب قائمة ${fmt(p7)}${dS != null ? ` (أقرب سرب على بعد ${Math.round(dS)} كم)` : ""} · مسارات الرياح ${fmt(ts.P7)}`,
+    `مشاهدات الفاو خلال 30 يوماً: ${cnt("S")} سرب، ${cnt("B")} شريط نطاط، ${cnt("H")} نطاط، ${cnt("A")} بالغ`,
     sum.eta !== null ? `أقرب وصول مرجّح بعد ${Math.round(sum.eta)} ساعة من «${sum.etaSrc.src.name}» (المدى ${Math.round(sum.eta10)}–${Math.round(sum.eta90)} ساعة)` : `لا وصول مرجّح ضمن أفق التنبؤ`,
     `نماذج الرياح التي ترى خطر وصول: ${sum.modelReach.filter(Boolean).length}/3 (ECMWF ${fmt(sum.modelP[0])}، GFS ${fmt(sum.modelP[1])}، ICON ${fmt(sum.modelP[2])})`,
     `الخطر الموسمي للأشهر القادمة: ${sr.months.map(m => `${m.key} ${Math.round(m.risk * 100)}`).join(" · ")}`,
     top.length ? `أكبر المصادر: ${top.map(x => `${x.src.name} (${fmt(x.contrib)})`).join("، ")}` : "",
-    `مستوى الفاو المُدخل: ${fao} · ${new Date().toISOString()}`
+    `مستوى الفاو المعتمد: ${fao} · ${new Date().toISOString()}`
   ].filter(Boolean);
   const text = lines.join("\n");
   fs.mkdirSync(path.join(dir, "reports"), { recursive: true });
-  const report = { time: new Date().toISOString(), level: level.i, levelName: LEVEL_NAMES[level.i], reason: level.why, P48: sum.P2, P7: sum.P7, P16: sum.PH, eta: sum.eta, etaRange: [sum.eta10, sum.eta90], models: { ECMWF: sum.modelP[0], GFS: sum.modelP[1], ICON: sum.modelP[2] }, seasonal: sr.months.map(m => ({ month: m.key, risk: m.risk })), fao, text };
+  const report = { time: new Date().toISOString(), level: level.i, levelName: LEVEL_NAMES[level.i], reason: level.why, P48: sum.P2, P7: sum.P7, P16: sum.PH, proximity7: p7, nearestSwarmKm: dS, faoCounts30: { swarms: cnt("S"), bands: cnt("B"), hoppers: cnt("H"), adults: cnt("A") }, eta: sum.eta, etaRange: [sum.eta10, sum.eta90], models: { ECMWF: sum.modelP[0], GFS: sum.modelP[1], ICON: sum.modelP[2] }, seasonal: sr.months.map(m => ({ month: m.key, risk: m.risk })), fao, text };
   fs.writeFileSync(path.join(dir, "reports", `report-${stamp}.json`), JSON.stringify(report, null, 2));
   fs.writeFileSync(path.join(dir, "reports", "latest.txt"), text + "\n");
   console.log("\n" + text + "\n");
